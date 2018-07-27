@@ -10,3 +10,5 @@ R files should run as is
 Things to implement:
   Algorithm for simulating the tournament rather than brute forcing each round as is currently.
   Fine tune models and try other ones as well.
+
+Download Paper.html for easy viewing.
