@@ -4,9 +4,9 @@ library(tidyr)
 library(ggplot2)
 library(caTools)
 library(caret)
-library(fastAdaboost)
 library(randomForest)
 library(gbm)
+library(knitr)
 
 #Load datasets
 compSeason <- read.csv('RegularSeasonCompactResults.csv')

@@ -45,6 +45,17 @@ log_reg <- glm(as.formula(paste(colnames(train_set)[15], "~",
                data = train_set)
 summary(log_reg)
 
+#Drop DiffFtm which was causing rank-deficientcy
+train_set <- train_set[ , c(1:20,22:29)]
+test_set <- test_set[ , c(1:20,22:29)]
+
+log_reg <- glm(as.formula(paste(colnames(train_set)[15], "~",
+                                paste(colnames(train_set)[c(6,10,16:28)], collapse = "+"),
+                                sep = "")),
+               family = binomial(link = 'logit'),
+               data = train_set)
+summary(log_reg)
+
 prob_pred <- predict(log_reg, type = 'response', newdata = test_set)
 y_pred <- ifelse(prob_pred > 0.5, 1, 0)
 
@@ -74,14 +85,15 @@ cat(accuracy, 'accuracy')
 ###################### Random Forest 65.67% ###################################################################################
 fitControl <- trainControl(method = 'repeatedcv',
                            number = 10,
-                           repeats = 3 )
+                           repeats = 3
+                           )
 
 rfgrid <- expand.grid(mtry = c(4,5,6))
 forest <- train(as.formula(paste(colnames(train_set)[15], "~", 
-                                 paste(colnames(train_set)[c(6,10,16:29)], collapse = "+"), 
+                                 paste(colnames(train_set)[c(6,10,16:28)], collapse = "+"), 
                                  sep = '')), data = train_set, method = 'rf', trControl = fitControl, tuneGrid = rfgrid)
 forest <- randomForest(as.formula(paste(colnames(train_set)[15], "~", 
-                                        paste(colnames(train_set)[c(6,10,16:29)], collapse = "+"), 
+                                        paste(colnames(train_set)[c(6,10,16:28)], collapse = "+"), 
                                         sep = '')), data = train_set, ntree = 400, mtry = 6)
 
 prob_pred <- predict(forest, newdata = test_set, type = 'response')
@@ -94,11 +106,10 @@ varImpPlot(forest)
 layout(matrix(c(1,2),nrow=1),
        width=c(4,1)) 
 par(mar=c(5,4,4,0)) #No margin on the right side
-plot(forest, log = 'y')
+rf_plot <- plot(forest, log = 'y', main = 'MSE rates for Random Forest')
 par(mar=c(5,0,4,2)) #No margin on the left side
-plot(c(0,1),type="n", axes=F, xlab="", ylab="")
+plot(c(0,1),type="n", axes=F, xlab="Trees", ylab="")
 legend("top", c('OOB','Lose','Win'),cex=0.8,fill=1:4)
-
 
 ###################### Boosting  70.14% ###################################################################################
 
@@ -112,7 +123,7 @@ fitControl <- trainControl(## 5-fold CV
   number = 5,
   repeats = 3)
 
-gbm <- train(as.formula(paste(colnames(train_set)[15],'~',paste(colnames(train_set)[c(6,10,16:29)], collapse = '+'),sep = '')), 
+gbm <- train(as.formula(paste(colnames(train_set)[15],'~',paste(colnames(train_set)[c(6,10,16:28)], collapse = '+'),sep = '')), 
              data = train_set, method = 'gbm', trControl = fitControl, tuneGrid = gbmgrid, nTrain = .5)
 plot(gbm)
 
@@ -121,7 +132,7 @@ train_set$Team1Win <- train_set$Team1Win - 1
 test_set$Team1Win <- as.numeric(test_set$Team1Win)
 test_set$Team1Win <- test_set$Team1Win - 1
 
-boost <- gbm(as.formula(paste(colnames(train_set)[15],'~',paste(colnames(train_set)[c(6,10,16:29)], collapse = '+'),
+boost <- gbm(as.formula(paste(colnames(train_set)[15],'~',paste(colnames(train_set)[c(6,10,16:28)], collapse = '+'),
                         sep = '')), data = train_set, distribution = 'bernoulli', n.trees = 5000, 
              train.fraction = 0.5,interaction.depth = 6, n.minobsinnode = 10, verbose = TRUE )
 
@@ -133,13 +144,6 @@ sum(diag(cm)) / sum(cm)
 
 summary(boost)
 
-layout(matrix(c(1,2),nrow=1),
-       width=c(4,1)) 
-par(mar=c(5,4,4,0))
-par(mfrow = c(1,2))
-plot(boost, i = 'DiffFgm')
-plot(boost, i = 'DiffBlk')
-mean((prob_pred-test_set[,15])^2)
 
 ###################### Predicting the 2017 Tournament ################################################################## 
 # Round 1
@@ -301,3 +305,7 @@ finalPredictions <- finalPredictions[, c(1:8,11:14)]
 finalPredictions <- finalPredictions %>% left_join(teams, by = c('Team1' = 'Team_Id')) %>% left_join(teams, by = c('Team2' = 'Team_Id')) %>%
   rename(Name1 = Team_Name.x, Name2 = Team_Name.y)
 finalPredictions <- finalPredictions[, c(1:8,13:14,11:12)]
+round_acc <- data.frame(row.names = c('Round 1', 'Round 2', 'Round 3', 'Round 4', 'Round 5', 'Round 6'), 
+                        c(78.125,43.75,37.5,50,50,0))
+colnames(round_acc) <- 'Accuracy'
+round_acc
