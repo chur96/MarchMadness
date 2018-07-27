@@ -1,0 +1,537 @@
+---
+title: "March Madness"
+author: "Chan Hur"
+date: "July 26, 2018"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, results = 'asis')
+```
+
+```{r include = FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(caTools)
+library(caret)
+library(randomForest)
+library(gbm)
+library(knitr)
+library(pander)
+library(pubh)
+
+#Load datasets
+compSeason <- read.csv('RegularSeasonCompactResults.csv')
+detSeason <- read.csv('RegularSeasonDetailedResults.csv')
+teams <- read.csv('teams.csv')
+season <- read.csv('seasons.csv')
+compTour <- read.csv('TourneyCompactResults.csv')
+detTour <- read.csv('TourneyDetailedResults.csv')
+seeds <- read.csv('TourneySeeds.csv')
+```
+
+## Background
+  In the annual March Madness tournament, Sixty-four NCAA college basketball teams compete in order to determine the who is the best. Over the course of March, the teams play in single-elimination matches divided into four regions with seeds ranging from 1 to 16. Many basketball fans participate in the tournament by creating prediction brackets, a particularly difficult endeavor. Having no domain knowledge of college basketball, how accurately can I predict games with machine learning models.
+  
+## Data Wrangling
+  
+  The dataset for the 2017 March Madness tournament was gathered from Kaggle. It contained data on the teams, their respective seeds for a given year, and the teams' statistics for each year split into season and tournament performance, if they participated. The team statistics came in two flavors: compact and detailed. The compact dataset had data dating back to 1985, while the detailed dataset begins in 2003. The difference between the two is primarily how the detailed data has performance statistics i.e. field goals attempted/made, offensive rebounds, steals, etc. The tourney datasets will ultimately be used as the training datasets while the season datasets will be used for feature extraction.
+  
+  First, I joined the seeds and teams datasets so that it will be easier to add their respective information to the compact and detailed data. The seed column is split into region and seed so that we can have seeds as a numeric and region kept as reference for tournament slots. 
+```{r}
+#1. Data Wrangling 
+#Join seeds and team names for easier viewing
+#Split Seeds column into region and actual seed
+seeds <- seeds %>% left_join(teams, by = c('Team' = 'Team_Id')) %>% 
+  mutate(Region = substr(Seed,1,1)) %>% mutate(Seed = as.numeric(substr(Seed,2,3))) 
+seeds <- seeds[, c(1,5,2:4)]#Reorder Seeds columns
+pandoc.table(seeds[1:5,], style='rmarkdown')
+```
+
+  Then I joined the seeds table to the compact and detailed datasets. These datasets are structured such that their columns are divided into winner and losers. The problem with this structure is that if were to do classification later on, there would be a column with exclusively wins/1 and another column with losses/0. So I restructured it based on their team ID's and created columns Team1 and Team2, which randomizes and distributes wins and losses between the columns and a binary column for whether or not Team1 won was created. This process was only performed on the tourney datasets for now, because the season data required additional work beforehand. For instance, the season datasets contained data for matchups between non-seeded teams in upcoming tournaments so they needed to be filtered out.  
+  
+
+```{r}
+#Joining Compact Tourney with Seeds to add Team names and seeds for the season
+#We also make new columns Team1 and Team 2 to reorder matchups so one columns is not exclusively wins or losses
+#Rename columns to correspond correctly
+#pandoc.table(compTour[1:5,], style = 'rmarkdown')
+pandoc.table(compTour[1:5,], style = 'rmarkdown', split.table = 160, caption = 'Compact Tourney Before')
+compTour <- compTour %>% left_join(seeds, by = c('Season' = 'Season', 'Wteam' = 'Team')) %>%
+  left_join(seeds, c('Season' = 'Season', 'Lteam' = 'Team')) %>%
+  mutate(Team1 = ifelse(Wteam > Lteam, Wteam, Lteam), Team2 = ifelse(Wteam > Lteam, Lteam, Wteam)) %>%
+  rename(Seed2 = Seed.x, Seed1 = Seed.y, Winner = Team_Name.x, Loser = Team_Name.y, Region2 = Region.x, Region1 = Region.y) 
+compTour <- compTour[,c(1:3,11,9:10,4:5,14,12:13,6:8,15:16)] # Reorder columns
+compTour$Team1Win <- ifelse(compTour$Wteam == compTour$Team1,1,0) #Assign binary 1/0 for Win/Lose
+pandoc.table(compTour[1:5,], style = 'rmarkdown', split.table = 160, caption = 'Compact Tourney After')
+
+#Repeat for all large datasets CompSeason, detSeason, detTourney
+#For the Season datasets, filter out the games where only non-seeded teams played
+compSeason <- compSeason %>% left_join(seeds, c('Season' = 'Season', 'Wteam' = 'Team')) %>% 
+  left_join(seeds, c('Season' = 'Season', 'Lteam' = 'Team')) %>%
+  rename(Seed2 = Seed.x, Seed1 = Seed.y, Winner = Team_Name.x, Loser = Team_Name.y, Region2 = Region.x, Region1 = Region.y) %>%
+  filter(xor(xor(!is.na(Seed2),  !is.na(Seed1)), !is.na(Seed2) & !is.na(Seed1))) #Filter out matches between non-seeded teams
+compSeason <- compSeason[,c(1:3,11,9:10,4:5,14,12:13,6:8)]
+
+detTour <- detTour %>% left_join(seeds, by = c('Season' = 'Season', 'Wteam' = 'Team')) %>%
+  left_join(seeds, by = c('Season' = 'Season', 'Lteam' = 'Team')) %>%
+  mutate(Team1 = ifelse(Wteam > Lteam, Wteam, Lteam), Team2 = ifelse(Wteam > Lteam, Lteam, Wteam)) %>%
+  rename(Seed2 = Seed.x, Seed1 = Seed.y, Winner = Team_Name.x, Loser = Team_Name.y, Region2 = Region.x, Region1 = Region.y)
+detTour <- detTour[,c(1:3,37,35:36,4,9:21,5,40,38:39,6,22:34,7:8,41:42)]
+detTour$Team1Win <- ifelse(detTour$Wteam == detTour$Team1, 1, 0)
+
+detSeason <- detSeason %>% left_join(seeds, by = c('Season' = 'Season', 'Wteam' = 'Team')) %>%
+  left_join(seeds, by = c('Season' = 'Season', 'Lteam' = 'Team')) %>% 
+  rename(Seed2 = Seed.x, Seed1 = Seed.y, Winner = Team_Name.x, Loser = Team_Name.y, Region2 = Region.x, Region1 = Region.y) %>%
+  filter(xor(xor(!is.na(Seed2),  !is.na(Seed1)), !is.na(Seed2) & !is.na(Seed1))) #Filter out matches between non-seeded teams
+detSeason <- detSeason[,c(1:3,37,35:36,4,9:21,5,40,38:39,6,22:34,7:8)]
+```
+
+  From there, I split the season datasets into winners and losers and created a binary win/loss column for each of them. The datasets were then recombined row-wise and simultaneously filtered out rows for non-seeded teams. So now the season datasets contain match statistics for only the seeded teams which can be aggregated to be used as features for the model.  
+  
+  
+```{r}
+#2. Calculating average statistics for use in model
+#Split Season data into only winners and losers
+pandoc.table(compSeason[1:5,], type = 'rmarkdown', split.table = 140, caption = 'Compact Season Before')
+compSeasonW <- compSeason %>% select(1:7,13:14) %>%
+  rename(Team_ID = Wteam, Team = Winner, Seed = Seed2, Score = Wscore, Region = Region2) %>%
+  mutate(Win = 1)
+compSeasonL <- compSeason %>% select(1:2,8:14) %>%
+  rename(Team_ID = Lteam, Team = Loser, Seed = Seed1, Score = Lscore, Region = Region1) %>%
+  mutate(Win = 0)
+#Bind the Win and Lose datasets that were split but by row and filter out stats for non-seeded teams
+compSeason2 <- bind_rows(compSeasonW,compSeasonL) %>% filter(!is.na(Seed))
+pandoc.table(compSeason2[1:5,], style = 'rmarkdown', split.table = 160, caption = 'Compact Season After')
+#Name vectors to convert column names so they can be joined
+x <- c('Team_ID','Team','Region', 'Seed','Score','Fgm','Fga','Fgm3','Fga3',"Ftm", "Fta","Or", "Dr", "Ast",
+       "To", "Stl", "Blk","Pf", "Wloc")
+y <- c("Wteam",  "Winner", 'Region2', "Seed2",  "Wscore", "Wfgm",   "Wfga",   "Wfgm3",  "Wfga3",  "Wftm",   "Wfta",   "Wor",    "Wdr",
+       "Wast",   "Wto",    "Wstl",   "Wblk",   "Wpf",    "Wloc")
+z <- c("Lteam",  "Loser",  'Region1', "Seed1",  "Lscore", "Lfgm",   "Lfga",   "Lfgm3",  "Lfga3",  "Lftm",   "Lfta",   "Lor",    "Ldr",
+       "Last",   "Lto",    "Lstl",   "Lblk",   "Lpf",    "Wloc")
+
+#Rename columns and add win/lose binary
+detSeasonW <- detSeason %>% select(1:20,39:40) %>% 
+  rename_at(vars(y), ~x) %>% 
+  mutate(Win = 1)
+detSeasonL <- detSeason %>% select(1:2,21:40) %>% 
+  rename_at(vars(z), ~x) %>%
+  mutate(Win = 0)
+#Bind season datasets by row and filter out non-seeded teams
+detSeason2 <- bind_rows(detSeasonW,detSeasonL) %>% filter(!is.na(Team))
+pandoc.table(detSeason2[1:5,], style = 'rmarkdown', caption = 'Detail Season Data After', split.table = 200)
+```
+
+  Now we can start aggregating statistics for the model. From the compact season data, I calculated the number of wins and percent of matches won for each team in a season and attached the win percentage to the compact tourney data. Next, from the detailed season data, I calculated the average match statistics for each team in each season. Because there are a lot of features in the detailed dataset, I calculated the difference between the two teams' respective average statistics to reduce the dismensionality of features that will be used in the model.
+  
+  
+```{r}
+#Find the win percentage of each seeded team for each season in compact season data
+df2 <- compSeason2 %>% group_by(Season, Team) %>% count(Team, Team_ID, Win) %>% spread(Win, n, fill = 0)
+colnames(df2)[c(4,5)] <- c('Lose','Win') #Rename columns so they aren't '0' or '1'
+df2 <- df2 %>% mutate(WinPct = Win / (Win + Lose)) #Calculate Win Percentae
+df2 <- df2[, -c(2,4,5)] #Drop unnecessary columns
+#Add win percentage to Team1 of compact tourney data set
+compTour <- compTour %>% left_join(df2, by = c('Season' = 'Season', 'Team1' = 'Team_ID'))
+colnames(compTour)[18] <- 'Team1WinPct' #Rename column for use
+compTour$Team1Win <- as.factor(compTour$Team1Win)
+
+#Calculate average team statistics for each team in the season
+df2 <- detSeason2 %>% group_by(Season, Team_ID) %>% 
+  summarise_at(.vars = c( "Score",   "Fgm",     "Fga",    "Fgm3",    "Fga3",    "Ftm",     "Fta", 
+                          "Or",      "Dr",      "Ast",     "To",      "Stl",    "Blk",     "Pf"), mean)
+
+#Join the average stats to the detailed tourney data and rename the column names to differentiate
+detTour2 <- detTour %>% left_join(df2, by = c('Season' = 'Season', 'Team1' = 'Team_ID'))
+colnames(detTour2)[44:57] <- paste('Team1Avg', colnames(detTour2)[44:57], sep = '')
+detTour2 <- detTour2 %>% left_join(df2, by = c('Season' = 'Season', 'Team2' = 'Team_ID'))
+colnames(detTour2)[58:71] <- paste('Team2Avg', colnames(detTour2)[58:71], sep = '')
+#Drop statistics of the actual matches that occurred
+detTour2 <- detTour2[, -c(7:20,25:38)]
+detTour2$Team1Win <- as.factor(detTour2$Team1Win)
+pandoc.table(detTour2[1:5, c(1,4,8,16:29,30:43)], style = 'rmarkdown', caption = 'Detailed Tourney Averages', split.table = 250)
+
+#New dataframe for Detailed Tourney with differences in team stats for reducing dimensionality
+detTourT1 <- detTour2[,c(16:29)]
+detTourT2 <- detTour2[,c(30:43)]
+detTour3 <- detTourT1 - detTourT2
+colnames(detTour3) <- paste('Diff', c( "Score",   "Fgm",     "Fga",    "Fgm3",    "Fga3",    "Ftm",     "Fta", 
+                                       "Or",      "Dr",      "Ast",     "To",      "Stl",    "Blk",     "Pf")
+                            , sep = '')
+finalTour <- bind_cols(detTour2,detTour3)
+finalTour <- finalTour[,c(1:15,44:57)]
+pandoc.table(finalTour[1:5,c(1,4,8,16:29)], style = 'rmarkdown', caption = 'Detailed Tourney Average Differences', split.table = 210)
+```
+  
+  The last step in the data wrangling process was to create the 2017 tourney bracket. The bracket was created with only the first round match ups as the latter rounds will be added after implementing the model. The 2017 tourney bracket was created in the same manner as the other tourney dataset as detailed above except with the addition of slots and next round columns which will be used to determine which teams proceed to the next round.
+  
+```{r include = FALSE}
+#3. Build 2017 Tourney Data to predict the 2017 tourney
+seeds2017 <- read.csv('TourneySeeds.csv') %>% filter(Season == 2017) %>% mutate(Seed = substr(Seed,1,3))
+seeds2017 <- seeds2017[-c(11,18,50,63),]
+slots <- read.csv('TourneySlots.csv')
+slots$Slot <- as.character(slots$Slot)
+slots <- slots %>% filter(Season == 2017)
+slots <- slots[5:67,]
+slots <- slots %>% mutate(Region1 = substr(Strongseed,1,1)) %>% mutate(Seed1 = as.numeric(substr(Strongseed,2,3))) %>%
+  mutate(Region2 = substr(Weakseed,1,1)) %>% mutate(Seed2 = as.numeric(substr(Weakseed,2,3)))
+slots$nextRound1 <- NA
+slots$nextRound2 <- NA
+slots <- slots %>% left_join(seeds2017, by = c('Season' = 'Season', 'Strongseed' = 'Seed')) %>% 
+  left_join(seeds2017, by = c('Season' = 'Season', 'Weakseed' = 'Seed')) %>% rename(Team1 = Team.x, Team2 = Team.y)
+
+#Calculate statistics from season 2017
+season2017 <- detSeason2 %>% filter(Season == 2017)
+season2017 <- season2017 %>% group_by(Season, Team_ID) %>% 
+  summarise_at(.vars = c( "Score",   "Fgm",     "Fga",    "Fgm3",    "Fga3",    "Ftm",     "Fta", 
+                          "Or",      "Dr",      "Ast",     "To",      "Stl",    "Blk",     "Pf"), mean)
+```
+```{r}
+#Add the season statistics to the tourney and rename as before
+r1 <- slots[1:32,] %>% left_join(season2017, by = c('Season' = 'Season', 'Team1' = 'Team_ID'))
+colnames(r1)[13:26] <- paste('Team1Avg', colnames(r1)[13:26], sep = '')
+r1 <- r1 %>% left_join(season2017, by = c('Season' = 'Season', 'Team2' = 'Team_ID'))
+colnames(r1)[27:40] <- paste('Team2Avg', colnames(r1)[27:40], sep = '')
+r1 <- cbind(r1, r1[,13:26] - r1[,27:40])
+colnames(r1)[41:54] <- paste('Diff', colnames(season2017)[3:16], sep='')
+pandoc.table(r1[1:5, 1:10], style = 'rmarkdown', caption = 'Round 1', split.table = 150)
+#Drop unecessary dataframes
+rm(compSeasonL,compSeasonW,detSeasonL,detSeasonW,df2, detTourT1,detTour3,detTourT2)
+```
+
+## Logistic Regression
+
+  Now we can start training the models. So I started off simple with the first model using Logistic Regression. My train/test split was composed of the test set having one tournament for prediction and the training set having the rest of the past tournaments for training.   This initial model was only trained with the teams' seeds and win percentages just to establish a baseline.
+  
+```{r}
+set.seed(101)
+#2. Splitting into training and test sets
+#Train/Test on season since we are predicting a tourney
+train_set <- compTour %>% filter(Season <= 2015)
+test_set <- compTour %>% filter(Season > 2015)
+
+#Train logistic regression model with Team1Win as dependent on Seed1, Seed2, and WinPct
+base_log_reg <- glm(Team1Win ~ Seed1 + Seed2 + Team1WinPct, 
+               family = binomial(link = 'logit'), 
+               data = train_set)
+kable(glm_coef(base_log_reg))
+
+#Predicting with the test set
+prob_pred <- predict(base_log_reg, type = 'response', newdata = test_set)
+#Assign 1 if greater than 0.50 and 0 otherwise 
+y_pred <- ifelse(prob_pred > 0.5, 1, 0)
+
+#Confusion matrix to see how accurate
+cm  <- table(test_set[,17], y_pred)
+pandoc.table(table(test_set[,17], y_pred), caption = 'Confusion Matrix')
+cat((cm[1,1] + cm[2,2]) / sum(cm), "accuracy")
+```
+
+  The next model incorporated the differences in average match statistics of the teams. Running the model warned us of being rank-deficient which could mean some of the features may be collinear. Using the 'findLinearCombos' function in caret shows that the DiffFtm column should be removed. Now we can run the model properly and We see that the model has improved slightly in performance compared to the baseline model.  
+  
+  
+```{r}
+#Train logistic model using Detailed Season data
+train_set <- finalTour %>% filter(Season <= 2015)
+test_set <- finalTour %>% filter(Season > 2015)
+
+log_reg2 <- glm(as.formula(paste(colnames(train_set)[15], "~",
+                                 paste(colnames(train_set)[c(6,10,16:29)], collapse = "+"),
+                                 sep = "")),
+               family = binomial(link = 'logit'),
+               data = train_set)
+
+findLinearCombos(test_set[, 16:29])
+train_set <- train_set[ , c(1:20,22:29)]
+test_set <- test_set[ , c(1:20,22:29)]
+
+log_reg2 <- glm(as.formula(paste(colnames(train_set)[15], "~",
+                                paste(colnames(train_set)[c(6,10,16:28)], collapse = "+"),
+                                sep = "")),
+               family = binomial(link = 'logit'),
+               data = train_set)
+kable(glm_coef(log_reg2))
+prob_pred <- predict(log_reg2, type = 'response', newdata = test_set)
+y_pred <- ifelse(prob_pred > 0.5, 1, 0)
+cm  <- table(test_set[,15], y_pred)
+pandoc.table(table(test_set[,15], y_pred), caption = 'Confusion Matrix')
+cat((cm[1,1] + cm[2,2]) / sum(cm), "accuracy")
+
+```
+
+# Cross Validation
+  I then performed a k-fold cross-validation with 10 folds to check the model's performance. It returned an accuracy that was very close to the one reported for the model so there are no issues here. 
+  
+  
+```{r}
+
+folds <- createFolds(train_set, k = 10)
+cv <- lapply(folds, function(x){
+  train_fold <- train_set[-x,]
+  test_fold <- test_set[-x,]
+  log_reg <- glm(as.formula(paste(colnames(train_set)[15], "~",
+                                 paste(colnames(train_set)[c(6,10,16:28)], collapse = "+"),
+                                 sep = "")),
+                family = binomial(link = 'logit'),
+                data = train_fold)
+  prob_pred <- predict(log_reg, type = 'response', newdata = test_fold)
+  y_pred <- ifelse(prob_pred > 0.5, 1, 0)
+  cm <- table(test_fold[,15], y_pred)
+  accuracy <- sum(diag(cm)) / sum(cm)
+  return(accuracy)
+})
+accuracy <- mean(as.numeric(cv))
+cat(accuracy, 'accuracy')
+```
+
+## Random Forest
+
+  The next model I used was random forest. Using grid search, I fine-tuned the parameter for variable sub-selection with a 10-fold cross-validation that was repeated 3 times. The result was that the parameter should be set to 6, which is a bit higher than the rule of thumb of using $\sqrt{p}$ of the total predictors p. As for model performance, the random forest did perform better than the logistic regression. No cross-validation of the model's performance was required due to how random forests prevent overfitting and are reliable. The variable importance plot seems to say that turnovers, field goals, and blocks were the most important. Seed2 is also higher than Seed1 which is likely due to Seed2 columns having the ranks 1-8 while Seed1 contains 9-16. The MSE rates appear to have little variation after about 200 trees.
+  
+  
+```{r}
+fitControl <- trainControl(method = 'repeatedcv',
+                           number = 10,
+                           repeats = 3 )
+
+rfgrid <- expand.grid(mtry = c(4,5,6))
+# forest <- train(as.formula(paste(colnames(train_set)[15], "~", 
+#                                  paste(colnames(train_set)[c(6,10,16:28)], collapse = "+"), 
+#                                  sep = '')), data = train_set, method = 'rf', trControl = fitControl, tuneGrid = rfgrid)
+forest <- randomForest(as.formula(paste(colnames(train_set)[15], "~", 
+                                        paste(colnames(train_set)[c(6,10,16:28)], collapse = "+"), 
+                                        sep = '')), data = train_set, ntree = 400, mtry = 6)
+prob_pred <- predict(forest, newdata = test_set, type = 'response')
+
+varImpPlot(forest, main = 'Variable Importance Plot')
+layout(matrix(c(1,2),nrow=1),
+       width=c(4,1)) 
+par(mar=c(5,4,4,0)) #No margin on the right side
+plot(forest, log = 'y', main = 'MSE Rates for Random Forest')
+par(mar=c(5,0,4,2)) #No margin on the left side
+plot(c(0,1),type="n", axes=F, xlab="", ylab="")
+legend("top", c('OOB','Lose','Win'),cex=0.8,fill=1:4)
+```
+```{r}
+cm  <- table(test_set[,15], prob_pred)
+pandoc.table(table(test_set[,15], prob_pred), caption = 'Confusion Matrix')
+cat((cm[1,1] + cm[2,2]) / sum(cm), "accuracy")
+```
+
+## Boosting
+
+  The last predictive model used was boosting. Grid search was used again to fine-tune the parameters for the model using a 5-fold cross-validation repeated 3 times. The values selected from the tuning were: 5000 trees, an interaction depth of 6, a shrinkage of .001, and a minimum number of observations of 10. The boosting model seems to perform only slightly better than the random forest model. The boosting model appears to highly value the same variables that the random forest model did.
+
+```{r}
+gbmgrid <- expand.grid(n.trees = c(5,7,9)*1000,
+                       interaction.depth = c(2,4,6),
+                       shrinkage = c(.01, .005, .001),
+                       n.minobsinnode = c(10,20,40)
+)
+fitControl <- trainControl(## 5-fold CV
+  method = "repeatedcv",
+  number = 5,
+  repeats = 3)
+
+# gbm <- train(as.formula(paste(colnames(train_set)[15],'~',paste(colnames(train_set)[c(6,10,16:29)], collapse = '+'),sep = '')), 
+#              data = train_set, method = 'gbm', trControl = fitControl, tuneGrid = gbmgrid, nTrain = .5)
+
+#plot(gbm)
+
+train_set$Team1Win <- as.numeric(train_set$Team1Win)
+train_set$Team1Win <- train_set$Team1Win - 1
+test_set$Team1Win <- as.numeric(test_set$Team1Win)
+test_set$Team1Win <- test_set$Team1Win - 1
+
+boost <- gbm(as.formula(paste(colnames(train_set)[15],'~',paste(colnames(train_set)[c(6,10,16:28)], collapse = '+'),
+                        sep = '')), data = train_set, distribution = 'bernoulli', n.trees = 5000, 
+             train.fraction = 0.5,interaction.depth = 6, n.minobsinnode = 10, verbose = FALSE )
+summary(boost)
+
+#pander(boost)
+prob_pred <- predict(boost, newdata = test_set, n.trees = 1000,type = 'response')
+y_pred <- ifelse(prob_pred > 0.5, 1, 0)
+
+cm  <- table(test_set[,15], y_pred)
+pandoc.table(table(test_set[,15], y_pred), caption = 'Confusion Matrix')
+cat((cm[1,1] + cm[2,2]) / sum(cm), "accuracy")
+
+
+```
+
+
+## Predicting the 2017 Tournament
+
+  Now we can finally implement a model to predict the 2017 tournament. I decided to go with the boosting model as it performed the best out of the three. In the end, the model predicted that UCLA would win the 2017 tournament. Of course that was not the case in reality. Starting from the baseline logistic regression model with 58% accuracy, I was able to achieve a model performance of 70%, a fairly significant boost. 
+  Regarding the actual prediction of the tournament, I was able to achieve a 78.125% accuracy of the first round. As rounds progress, accuracy obviously drops since it misclassifies some teams advancing when others should. However, it was able to predict one of the finalists of the tournament which is pretty good.
+```{r}
+# Round 1
+train_set <- finalTour
+test_set <- r1
+train_set$Team1Win <- as.numeric(train_set$Team1Win)
+train_set$Team1Win <- train_set$Team1Win - 1
+
+boost <- gbm(as.formula(paste(colnames(train_set)[15],'~',paste(colnames(train_set)[c(6,10,16:29)], collapse = '+'),
+                              sep = '')), data = train_set, distribution = 'bernoulli', n.trees = 5000, 
+             train.fraction = 0.5,interaction.depth = 6, n.minobsinnode = 10, verbose = FALSE )
+
+prob_pred <- predict(boost, newdata = test_set[,c(6,8,41:54)], n.trees = 1000,type = 'response')
+y_pred <- ifelse(prob_pred > 0.5, 1, 0)
+test_set$Team1Win <- y_pred
+test_set$probability <- prob_pred
+test_set$nextRound1 <- ifelse(test_set$Team1Win == 1, test_set$Slot, NA)
+test_set$nextRound2 <- ifelse(test_set$Team1Win == 0, test_set$Slot, NA)
+test_set <- test_set[, c(1:12,55,56,13:54)] #Round 1 predictions
+df <- seeds2017 %>% left_join(test_set[,c(9,11)], by = c('Team' = 'Team1')) %>% left_join(test_set[,c(10,12)], by = c('Team' = 'Team2'))
+df <- df[-which(rowMeans(is.na(df)) > .2),]
+df$nextRound <- ifelse(is.na(df$nextRound1), df$nextRound2, df$nextRound1)
+df <- df[,c(1:3,6)]
+df <- df %>% mutate(Region = substr(Seed,1,1)) %>% mutate(Seed = as.numeric(substr(Seed,2,3)))
+
+#Round 2
+r2 <- slots[33:48,1:4]
+r2 <- r2 %>% left_join(df, by = c('Season' = 'Season', 'Strongseed' = 'nextRound')) %>% 
+  left_join(df, by = c('Season' = 'Season', 'Weakseed' = 'nextRound')) %>% 
+  rename(Seed1 = Seed.x, Seed2 = Seed.y, Region1 = Region.x, Region2 = Region.y, Team1 = Team.x, Team2 = Team.y)
+
+r2 <- r2 %>% left_join(season2017, by = c('Season' = 'Season', 'Team1' = 'Team_ID'))
+colnames(r2)[11:24] <- paste('Team1Avg', colnames(r2)[11:24], sep = '')
+r2 <- r2 %>% left_join(season2017, by = c('Season' = 'Season', 'Team2' = 'Team_ID'))
+colnames(r2)[25:38] <- paste('Team2Avg', colnames(r2)[25:38], sep = '')
+r2 <- cbind(r2, r2[,11:24] - r2[,25:38])
+colnames(r2)[39:52] <- paste('Diff', colnames(season2017)[3:16], sep='')
+
+prob_pred <- predict(boost, newdata = r2[,c(5,8,39:52)], n.trees = 1000,type = 'response')
+y_pred <- ifelse(prob_pred > 0.5, 1, 0)
+r2$Team1Win <- y_pred
+r2$probability <- prob_pred
+r2$nextRound1 <- ifelse(r2$Team1Win == 1, r2$Slot, NA)
+r2$nextRound2 <- ifelse(r2$Team1Win == 0, r2$Slot, NA)
+r2 <- r2[, c(1:10,53:56,11:52)] #Round 1 predictions
+df <- seeds2017 %>% left_join(r2[,c(6,13)], by = c('Team' = 'Team1')) %>% left_join(r2[,c(9,14)], by = c('Team' = 'Team2'))
+df <- df[-which(rowMeans(is.na(df)) > .2),]
+df$nextRound <- ifelse(is.na(df$nextRound1), df$nextRound2, df$nextRound1)
+df <- df[,c(1:3,6)]
+df <- df %>% mutate(Region = substr(Seed,1,1)) %>% mutate(Seed = as.numeric(substr(Seed,2,3)))
+
+#Round 3
+r3 <- slots[49:56,1:4]
+r3 <- r3 %>% left_join(df, by = c('Season' = 'Season', 'Strongseed' = 'nextRound')) %>% 
+  left_join(df, by = c('Season' = 'Season', 'Weakseed' = 'nextRound')) %>% 
+  rename(Seed1 = Seed.x, Seed2 = Seed.y, Region1 = Region.x, Region2 = Region.y, Team1 = Team.x, Team2 = Team.y)
+
+r3 <- r3 %>% left_join(season2017, by = c('Season' = 'Season', 'Team1' = 'Team_ID'))
+colnames(r3)[11:24] <- paste('Team1Avg', colnames(r3)[11:24], sep = '')
+r3 <- r3 %>% left_join(season2017, by = c('Season' = 'Season', 'Team2' = 'Team_ID'))
+colnames(r3)[25:38] <- paste('Team2Avg', colnames(r3)[25:38], sep = '')
+r3 <- cbind(r3, r3[,11:24] - r3[,25:38])
+colnames(r3)[39:52] <- paste('Diff', colnames(season2017)[3:16], sep='')
+
+prob_pred <- predict(boost, newdata = r3[,c(5,8,39:52)], n.trees = 1000,type = 'response')
+y_pred <- ifelse(prob_pred > 0.5, 1, 0)
+r3$Team1Win <- y_pred
+r3$probability <- prob_pred
+r3$nextRound1 <- ifelse(r3$Team1Win == 1, r3$Slot, NA)
+r3$nextRound2 <- ifelse(r3$Team1Win == 0, r3$Slot, NA)
+r3 <- r3[, c(1:10,53:56,11:52)] #Round 1 predictions
+df <- seeds2017 %>% left_join(r3[,c(6,13)], by = c('Team' = 'Team1')) %>% left_join(r3[,c(9,14)], by = c('Team' = 'Team2'))
+df <- df[-which(rowMeans(is.na(df)) > .2),]
+df$nextRound <- ifelse(is.na(df$nextRound1), df$nextRound2, df$nextRound1)
+df <- df[,c(1:3,6)]
+df <- df %>% mutate(Region = substr(Seed,1,1)) %>% mutate(Seed = as.numeric(substr(Seed,2,3)))
+
+# Round 4
+r4 <- slots[57:60,1:4]
+r4 <- r4 %>% left_join(df, by = c('Season' = 'Season', 'Strongseed' = 'nextRound')) %>% 
+  left_join(df, by = c('Season' = 'Season', 'Weakseed' = 'nextRound')) %>% 
+  rename(Seed1 = Seed.x, Seed2 = Seed.y, Region1 = Region.x, Region2 = Region.y, Team1 = Team.x, Team2 = Team.y)
+
+r4 <- r4 %>% left_join(season2017, by = c('Season' = 'Season', 'Team1' = 'Team_ID'))
+colnames(r4)[11:24] <- paste('Team1Avg', colnames(r4)[11:24], sep = '')
+r4 <- r4 %>% left_join(season2017, by = c('Season' = 'Season', 'Team2' = 'Team_ID'))
+colnames(r4)[25:38] <- paste('Team2Avg', colnames(r4)[25:38], sep = '')
+r4 <- cbind(r4, r4[,11:24] - r4[,25:38])
+colnames(r4)[39:52] <- paste('Diff', colnames(season2017)[3:16], sep='')
+
+prob_pred <- predict(boost, newdata = r4[,c(5,8,39:52)], n.trees = 1000,type = 'response')
+y_pred <- ifelse(prob_pred > 0.5, 1, 0)
+r4$Team1Win <- y_pred
+r4$probability <- prob_pred
+r4$nextRound1 <- ifelse(r4$Team1Win == 1, r4$Slot, NA)
+r4$nextRound2 <- ifelse(r4$Team1Win == 0, r4$Slot, NA)
+r4 <- r4[, c(1:10,53:56,11:52)] #Round 1 predictions
+df <- seeds2017 %>% left_join(r4[,c(6,13)], by = c('Team' = 'Team1')) %>% left_join(r4[,c(9,14)], by = c('Team' = 'Team2'))
+df <- df[-which(rowMeans(is.na(df)) > .2),]
+df$nextRound <- ifelse(is.na(df$nextRound1), df$nextRound2, df$nextRound1)
+df <- df[,c(1:3,6)]
+df <- df %>% mutate(Region = substr(Seed,1,1)) %>% mutate(Seed = as.numeric(substr(Seed,2,3)))
+
+#Round 5
+r5 <- slots[61:62,1:4]
+r5 <- r5 %>% left_join(df, by = c('Season' = 'Season', 'Strongseed' = 'nextRound')) %>% 
+  left_join(df, by = c('Season' = 'Season', 'Weakseed' = 'nextRound')) %>% 
+  rename(Seed1 = Seed.x, Seed2 = Seed.y, Region1 = Region.x, Region2 = Region.y, Team1 = Team.x, Team2 = Team.y)
+
+r5 <- r5 %>% left_join(season2017, by = c('Season' = 'Season', 'Team1' = 'Team_ID'))
+colnames(r5)[11:24] <- paste('Team1Avg', colnames(r5)[11:24], sep = '')
+r5 <- r5 %>% left_join(season2017, by = c('Season' = 'Season', 'Team2' = 'Team_ID'))
+colnames(r5)[25:38] <- paste('Team2Avg', colnames(r5)[25:38], sep = '')
+r5 <- cbind(r5, r5[,11:24] - r5[,25:38])
+colnames(r5)[39:52] <- paste('Diff', colnames(season2017)[3:16], sep='')
+
+prob_pred <- predict(boost, newdata = r5[,c(5,8,39:52)], n.trees = 1000,type = 'response')
+y_pred <- ifelse(prob_pred > 0.5, 1, 0)
+r5$Team1Win <- y_pred
+r5$probability <- prob_pred
+r5$nextRound1 <- ifelse(r5$Team1Win == 1, r5$Slot, NA)
+r5$nextRound2 <- ifelse(r5$Team1Win == 0, r5$Slot, NA)
+r5 <- r5[, c(1:10,53:56,11:52)] #Round 1 predictions
+df <- seeds2017 %>% left_join(r5[,c(6,13)], by = c('Team' = 'Team1')) %>% left_join(r5[,c(9,14)], by = c('Team' = 'Team2'))
+df <- df[-which(rowMeans(is.na(df)) > .2),]
+df$nextRound <- ifelse(is.na(df$nextRound1), df$nextRound2, df$nextRound1)
+df <- df[,c(1:3,6)]
+df <- df %>% mutate(Region = substr(Seed,1,1)) %>% mutate(Seed = as.numeric(substr(Seed,2,3)))
+
+#Round 6
+r6 <- slots[63,1:4]
+r6 <- r6 %>% left_join(df, by = c('Season' = 'Season', 'Strongseed' = 'nextRound')) %>% 
+  left_join(df, by = c('Season' = 'Season', 'Weakseed' = 'nextRound')) %>% 
+  rename(Seed1 = Seed.x, Seed2 = Seed.y, Region1 = Region.x, Region2 = Region.y, Team1 = Team.x, Team2 = Team.y)
+
+r6 <- r6 %>% left_join(season2017, by = c('Season' = 'Season', 'Team1' = 'Team_ID'))
+colnames(r6)[11:24] <- paste('Team1Avg', colnames(r6)[11:24], sep = '')
+r6 <- r6 %>% left_join(season2017, by = c('Season' = 'Season', 'Team2' = 'Team_ID'))
+colnames(r6)[25:38] <- paste('Team2Avg', colnames(r6)[25:38], sep = '')
+r6 <- cbind(r6, r6[,11:24] - r6[,25:38])
+colnames(r6)[39:52] <- paste('Diff', colnames(season2017)[3:16], sep='')
+
+prob_pred <- predict(boost, newdata = r6[,c(5,8,39:52)], n.trees = 1000,type = 'response')
+y_pred <- ifelse(prob_pred > 0.5, 1, 0)
+r6$Team1Win <- y_pred
+r6$probability <- prob_pred
+r6$nextRound1 <- ifelse(r6$Team1Win == 1, r6$Slot, NA)
+r6$nextRound2 <- ifelse(r6$Team1Win == 0, r6$Slot, NA)
+r6 <- r6[, c(1:10,53:56,11:52)] #Round 1 predictions
+df <- seeds2017 %>% left_join(r6[,c(6,13)], by = c('Team' = 'Team1')) %>% left_join(r6[,c(9,14)], by = c('Team' = 'Team2'))
+df <- df[-which(rowMeans(is.na(df)) > .2),]
+df$nextRound <- ifelse(is.na(df$nextRound1), df$nextRound2, df$nextRound1)
+df <- df[,c(1:3,6)]
+df <- df %>% mutate(Region = substr(Seed,1,1)) %>% mutate(Seed = as.numeric(substr(Seed,2,3)))
+
+################# Final Predictions #############################################################################################
+finalPredictions <- rbind(test_set,r2,r3,r4,r5,r6)
+finalPredictions <- finalPredictions[, c(1:8,11:14)]
+finalPredictions <- finalPredictions %>% left_join(teams, by = c('Team1' = 'Team_Id')) %>% left_join(teams, by = c('Team2' = 'Team_Id')) %>%
+  rename(Name1 = Team_Name.x, Name2 = Team_Name.y)
+finalPredictions <- finalPredictions[, c(1:8,13:14,11:12)]
+round_acc <- data.frame(row.names = c('Round 1', 'Round 2', 'Round 3', 'Round 4', 'Round 5', 'Round 6'), 
+                        c(78.125,43.75,37.5,50,50,0))
+colnames(round_acc) <- 'Percent Accurate %'
+pandoc.table(round_acc, style = 'rmarkdown')
+pandoc.table(finalPredictions, style = 'rmarkdown', caption = 'Final Predictions', split.table = 150)
+```
